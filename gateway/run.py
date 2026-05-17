@@ -9158,6 +9158,26 @@ class GatewayRunner:
 
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
+            # Some profiles use /model as a quick status check and don't want
+            # Telegram inline provider/model choices cluttering the chat. Keep
+            # switching available via explicit `/model <name> ...` commands.
+            try:
+                platform_cfg = cfg.get(str(source.platform).lower(), {}) if isinstance(cfg, dict) else {}
+            except Exception:
+                platform_cfg = {}
+            if (
+                isinstance(platform_cfg, dict)
+                and source.platform == "telegram"
+                and platform_cfg.get("show_model_choices") is False
+            ):
+                provider_label = get_label(current_provider)
+                return (
+                    f"Current model: `{current_model or 'unknown'}`\n"
+                    f"Provider: {provider_label}\n\n"
+                    "Model choices are hidden for this Telegram profile. "
+                    "To switch manually, use `/model <name> --provider <slug>`."
+                )
+
             # Try interactive picker if the platform supports it
             adapter = self.adapters.get(source.platform)
             has_picker = (
