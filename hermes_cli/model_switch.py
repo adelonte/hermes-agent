@@ -1232,7 +1232,8 @@ def list_authenticated_providers(
             try:
                 from hermes_cli.auth import _load_auth_store
                 store = _load_auth_store()
-                if store and hermes_id in store.get("credential_pool", {}):
+                pool_entries = (store.get("credential_pool", {}) or {}).get(hermes_id, []) if store else []
+                if pool_entries:
                     has_creds = True
             except Exception:
                 pass

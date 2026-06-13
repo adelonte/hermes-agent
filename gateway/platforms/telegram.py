@@ -510,6 +510,116 @@ class TelegramAdapter(BasePlatformAdapter):
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         return "*" in allowed_ids or normalized_user_id in allowed_ids
 
+    def _command_menu_authorized_chat_ids(self) -> List[str]:
+        """Return Telegram chat IDs that may receive the slash-command menu.
+
+        Telegram's default bot-command scope is public: anyone who opens a DM
+        with the bot can see it before our runtime authorization gate runs.  To
+        avoid leaking the command surface to unapproved users, we only publish
+        the menu to explicitly known/authorized chats (home channel, static
+        allowlists, and already-paired Telegram users).  Unknown users can still
+        complete the normal pairing flow, but they won't get autocomplete/menu
+        disclosure before approval.
+        """
+        chat_ids: set[str] = set()
+
+        home = getattr(self.config, "home_channel", None)
+        if home and getattr(home, "chat_id", None):
+            chat_ids.add(str(home.chat_id).strip())
+
+        for env_name in (
+            "TELEGRAM_ALLOWED_USERS",
+            "TELEGRAM_GROUP_ALLOWED_CHATS",
+        ):
+            for value in os.getenv(env_name, "").split(","):
+                candidate = value.strip()
+                if candidate and candidate != "*" and re.fullmatch(r"-?\d+", candidate):
+                    chat_ids.add(candidate)
+
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        pairing_store = getattr(runner, "pairing_store", None)
+        list_approved = getattr(pairing_store, "list_approved", None)
+        if callable(list_approved):
+            try:
+                approved_entries = list_approved("telegram")
+                if not isinstance(approved_entries, list):
+                    approved_entries = []
+                for entry in approved_entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    user_id = str(entry.get("user_id") or "").strip()
+                    if user_id and re.fullmatch(r"-?\d+", user_id):
+                        chat_ids.add(user_id)
+            except Exception:
+                logger.debug("[%s] Could not load paired Telegram users for command menu", self.name, exc_info=True)
+
+        return sorted(chat_ids)
+
+    async def _register_command_menu(self) -> None:
+        """Register Telegram slash commands without exposing them globally."""
+        from telegram import BotCommand
+        from hermes_cli.commands import telegram_menu_commands
+
+        menu_commands, hidden_count = telegram_menu_commands(max_commands=100)
+        commands = [BotCommand(name, desc) for name, desc in menu_commands]
+
+        bot = self._bot
+        if bot is None:
+            logger.debug("[%s] Telegram menu registration skipped: bot is not initialized", self.name)
+            return
+
+        expose_globally = os.getenv("TELEGRAM_EXPOSE_COMMAND_MENU", "").strip().lower() in {"1", "true", "yes", "on"}
+        if expose_globally:
+            await bot.set_my_commands(commands)
+            if hidden_count:
+                logger.info(
+                    "[%s] Telegram menu: %d commands registered globally, %d hidden (over 100 limit). Use /commands for full list.",
+                    self.name, len(menu_commands), hidden_count,
+                )
+            return
+
+        # Secure default: clear public command scopes first.  This removes any
+        # previously registered global menu so unapproved users see no commands
+        # just by opening the bot chat.
+        try:
+            from telegram import (
+                BotCommandScopeAllGroupChats,
+                BotCommandScopeAllPrivateChats,
+                BotCommandScopeDefault,
+            )
+
+            for scope in (
+                BotCommandScopeDefault(),
+                BotCommandScopeAllPrivateChats(),
+                BotCommandScopeAllGroupChats(),
+            ):
+                await bot.set_my_commands([], scope=scope)
+        except Exception:
+            # Older python-telegram-bot versions may not expose scope helpers;
+            # clearing the default scope still fixes the primary leak.
+            await bot.set_my_commands([])
+
+        try:
+            from telegram import BotCommandScopeChat
+        except Exception:
+            logger.info(
+                "[%s] Telegram menu: cleared global commands; per-chat command scopes unavailable in installed telegram library.",
+                self.name,
+            )
+            return
+
+        scoped_chat_ids = self._command_menu_authorized_chat_ids()
+        for chat_id in scoped_chat_ids:
+            await bot.set_my_commands(commands, scope=BotCommandScopeChat(chat_id=chat_id))
+
+        logger.info(
+            "[%s] Telegram menu: cleared global commands and registered %d commands for %d authorized chat(s)%s.",
+            self.name,
+            len(menu_commands),
+            len(scoped_chat_ids),
+            f"; {hidden_count} hidden over Telegram's 100-command limit" if hidden_count else "",
+        )
+
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
         if not metadata:
@@ -1392,24 +1502,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     error_callback=_polling_error_callback,
                 )
             
-            # Register bot commands so Telegram shows a hint menu when users type /
-            # List is derived from the central COMMAND_REGISTRY — adding a new
-            # gateway command there automatically adds it to the Telegram menu.
+            # Register bot commands so Telegram shows a hint menu when authorized users type /.
+            # SECURITY: do not publish commands to Telegram's default/global scope — that
+            # scope is visible to anyone who opens a DM with the bot before pairing/approval.
+            # _register_command_menu() clears public scopes and re-publishes only to known
+            # authorized chat IDs (home channel, allowlists, paired users).
             try:
-                from telegram import BotCommand
-                from hermes_cli.commands import telegram_menu_commands
-                # Telegram allows up to 100 commands but has an undocumented
-                # payload size limit.  Skill descriptions are truncated to 40
-                # chars in telegram_menu_commands() to fit 100 commands safely.
-                menu_commands, hidden_count = telegram_menu_commands(max_commands=100)
-                await self._bot.set_my_commands([
-                    BotCommand(name, desc) for name, desc in menu_commands
-                ])
-                if hidden_count:
-                    logger.info(
-                        "[%s] Telegram menu: %d commands registered, %d hidden (over 100 limit). Use /commands for full list.",
-                        self.name, len(menu_commands), hidden_count,
-                    )
+                await self._register_command_menu()
             except Exception as e:
                 logger.warning(
                     "[%s] Could not register Telegram command menu: %s",
