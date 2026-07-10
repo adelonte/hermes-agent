@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import HomeChannel, Platform, PlatformConfig
-from gateway.platforms.telegram import TelegramAdapter
+from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
 @pytest.mark.asyncio
